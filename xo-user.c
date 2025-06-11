@@ -14,6 +14,13 @@
 #define XO_DEVICE_FILE "/dev/kxo"
 #define XO_DEVICE_ATTR_FILE "/sys/class/kxo/kxo/kxo_state"
 
+// #ifdef DEBUG
+// #define printde(...) printf(__VA_ARGS__)
+// #else
+// #define printde(...)
+// #endif
+
+
 static bool status_check(void)
 {
     FILE *fp = fopen(XO_STATUS_FILE, "r");
@@ -82,6 +89,57 @@ static void listen_keyboard_handler(void)
     close(attr_fd);
 }
 
+static void print_board(const char *arr, const char *mov, int len)
+{
+    int i;
+
+    for (i = 1; i < 256; i <<= 1) {
+        if (arr[0] & i) {
+            printf("%c", (arr[2] & i) ? 'X' : 'O');
+        } else {
+            printf(" ");
+        }
+        if (i & 0x88) {
+            printf("\n-------\n");
+        } else {
+            printf("|");
+        }
+    }
+    for (i = 1; i < 256; i <<= 1) {
+        if (arr[1] & i) {
+            printf("%c", (arr[3] & i) ? 'X' : 'O');
+        } else {
+            printf(" ");
+        }
+        if (i & 8) {
+            printf("\n-------\n");
+        } else if (i & 0x80) {
+            printf("\n");
+        } else {
+            printf("|");
+        }
+    }
+    printf("\n\nmovement: %d\n", len);
+
+    for (i = 0; i < len; i++) {
+        printf("%c%d", (mov[i] >> 2) + 'A', mov[i] & 3);
+        if (i != len - 1)
+            printf(" -> ");
+    }
+    printf("\n");
+}
+
+static void print_win()
+{
+    int attr_fd = open(XO_DEVICE_ATTR_FILE, O_RDWR);
+    char buf[20];
+    read(attr_fd, buf, 8);
+    if (buf[6] != ' ')
+        printf("%c: win!!\n\n", buf[6]);
+    close(attr_fd);
+}
+
+
 int main(int argc, char *argv[])
 {
     if (!status_check())
@@ -90,14 +148,14 @@ int main(int argc, char *argv[])
     raw_mode_enable();
     int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
     fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
-
-    char display_buf[DRAWBUFFER_SIZE];
-
     fd_set readset;
     int device_fd = open(XO_DEVICE_FILE, O_RDONLY);
     int max_fd = device_fd > STDIN_FILENO ? device_fd : STDIN_FILENO;
+    char board[4];
+    char movement[16];
     read_attr = true;
     end_attr = false;
+    // printf("%c\n", end_attr?'T':'F');
 
     while (!end_attr) {
         FD_ZERO(&readset);
@@ -116,9 +174,15 @@ int main(int argc, char *argv[])
         } else if (read_attr && FD_ISSET(device_fd, &readset)) {
             FD_CLR(device_fd, &readset);
             printf("\033[H\033[J"); /* ASCII escape code to clear the screen */
-            read(device_fd, display_buf, DRAWBUFFER_SIZE);
-            display_buf[DRAWBUFFER_SIZE - 1] = '\0';
-            printf("%s", display_buf);
+            read(device_fd, board, 4);
+            char b_size;
+            read(device_fd, &b_size, 1);
+            b_size -= 5;
+            if (b_size > 0) {
+                read(device_fd, movement, (size_t) b_size);
+            }
+            print_board(board, movement, (int) b_size);
+            print_win();
         }
     }
 

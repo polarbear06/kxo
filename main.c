@@ -38,6 +38,7 @@ struct kxo_attr {
     char display;
     char resume;
     char end;
+    char win;
     rwlock_t lock;
 };
 
@@ -48,8 +49,8 @@ static ssize_t kxo_state_show(struct device *dev,
                               char *buf)
 {
     read_lock(&attr_obj.lock);
-    int ret = snprintf(buf, 7, "%c %c %c\n", attr_obj.display, attr_obj.resume,
-                       attr_obj.end);
+    int ret = snprintf(buf, 9, "%c %c %c %c\n", attr_obj.display,
+                       attr_obj.resume, attr_obj.end, attr_obj.win);
     read_unlock(&attr_obj.lock);
     return ret;
 }
@@ -60,8 +61,8 @@ static ssize_t kxo_state_store(struct device *dev,
                                size_t count)
 {
     write_lock(&attr_obj.lock);
-    sscanf(buf, "%c %c %c", &(attr_obj.display), &(attr_obj.resume),
-           &(attr_obj.end));
+    sscanf(buf, "%c %c %c %c", &(attr_obj.display), &(attr_obj.resume),
+           &(attr_obj.end), &(attr_obj.win));
     write_unlock(&attr_obj.lock);
     return count;
 }
@@ -78,7 +79,9 @@ static int major;
 static struct class *kxo_class;
 static struct cdev kxo_cdev;
 
-static char draw_buffer[DRAWBUFFER_SIZE];
+static char draw_buffer[21];
+static int draw_order = 5;
+
 
 /* Data are stored into a kfifo buffer before passing them to the userspace */
 static DECLARE_KFIFO_PTR(rx_fifo, unsigned char);
@@ -95,7 +98,8 @@ static DECLARE_WAIT_QUEUE_HEAD(rx_wait);
 /* Insert the whole chess board into the kfifo buffer */
 static void produce_board(void)
 {
-    unsigned int len = kfifo_in(&rx_fifo, draw_buffer, sizeof(draw_buffer));
+    draw_buffer[4] = draw_order;
+    unsigned int len = kfifo_in(&rx_fifo, draw_buffer, (size_t) draw_order);
     if (unlikely(len < sizeof(draw_buffer)))
         pr_warn_ratelimited("%s: %zu bytes dropped\n", __func__,
                             sizeof(draw_buffer) - len);
@@ -119,30 +123,56 @@ static struct circ_buf fast_buf;
 static char table[N_GRIDS];
 
 /* Draw the board into draw_buffer */
+// static int draw_board(char *table)
+// {
+//     int i = 0, k = 0;
+//     draw_buffer[i++] = '\n';
+//     smp_wmb();
+//     draw_buffer[i++] = '\n';
+//     smp_wmb();
+
+//     while (i < DRAWBUFFER_SIZE) {
+//         for (int j = 0; j < (BOARD_SIZE << 1) - 1 && k < N_GRIDS; j++) {
+//             draw_buffer[i++] = j & 1 ? '|' : table[k++];
+//             smp_wmb();
+//         }
+//         draw_buffer[i++] = '\n';
+//         smp_wmb();
+//         for (int j = 0; j < (BOARD_SIZE << 1) - 1; j++) {
+//             draw_buffer[i++] = '-';
+//             smp_wmb();
+//         }
+//         draw_buffer[i++] = '\n';
+//         smp_wmb();
+//     }
+
+
+//     return 0;
+// }
+
 static int draw_board(char *table)
 {
-    int i = 0, k = 0;
-    draw_buffer[i++] = '\n';
-    smp_wmb();
-    draw_buffer[i++] = '\n';
-    smp_wmb();
-
-    while (i < DRAWBUFFER_SIZE) {
-        for (int j = 0; j < (BOARD_SIZE << 1) - 1 && k < N_GRIDS; j++) {
-            draw_buffer[i++] = j & 1 ? '|' : table[k++];
-            smp_wmb();
+    int i, j;
+    char board_temp, chara_temp;
+    for (i = 0; i < N_GRIDS / 8; i++) {
+        board_temp = 0;
+        chara_temp = 0;
+        for (j = 0; j < 8; j++) {
+            if (table[i * 8 + j] == ' ')
+                board_temp &= ~(1 << j);
+            else {
+                board_temp |= 1 << j;
+                if (table[i * 8 + j] == 'X')
+                    chara_temp |= 1 << j;
+                else
+                    chara_temp &= ~(1 << j);
+            }
         }
-        draw_buffer[i++] = '\n';
+        draw_buffer[i] = board_temp;
         smp_wmb();
-        for (int j = 0; j < (BOARD_SIZE << 1) - 1; j++) {
-            draw_buffer[i++] = '-';
-            smp_wmb();
-        }
-        draw_buffer[i++] = '\n';
+        draw_buffer[i + N_GRIDS / 8] = chara_temp;
         smp_wmb();
     }
-
-
     return 0;
 }
 
@@ -208,12 +238,15 @@ static void ai_one_work_func(struct work_struct *w)
     mutex_lock(&producer_lock);
     int move;
     WRITE_ONCE(move, mcts(table, 'O'));
+    // draw_buffer[draw_order++] = move;
 
     smp_mb();
 
-    if (move != -1)
+    if (move != -1) {
         WRITE_ONCE(table[move], 'O');
-
+        WRITE_ONCE(draw_buffer[draw_order], move);
+        WRITE_ONCE(draw_order, draw_order + 1);
+    }
     WRITE_ONCE(turn, 'X');
     WRITE_ONCE(finish, 1);
     smp_wmb();
@@ -242,12 +275,15 @@ static void ai_two_work_func(struct work_struct *w)
     mutex_lock(&producer_lock);
     int move;
     WRITE_ONCE(move, negamax_predict(table, 'X').move);
+    // draw_buffer[draw_order++] = move;
 
     smp_mb();
 
-    if (move != -1)
+    if (move != -1) {
         WRITE_ONCE(table[move], 'X');
-
+        WRITE_ONCE(draw_buffer[draw_order], move);
+        WRITE_ONCE(draw_order, draw_order + 1);
+    }
     WRITE_ONCE(turn, 'O');
     WRITE_ONCE(finish, 1);
     smp_wmb();
@@ -341,6 +377,9 @@ static void timer_handler(struct timer_list *__timer)
     if (win == ' ') {
         ai_game();
         mod_timer(&timer, jiffies + msecs_to_jiffies(delay));
+        write_lock(&attr_obj.lock);
+        attr_obj.win = ' ';
+        write_unlock(&attr_obj.lock);
     } else {
         read_lock(&attr_obj.lock);
         if (attr_obj.display == '1') {
@@ -355,6 +394,7 @@ static void timer_handler(struct timer_list *__timer)
             /* Store data to the kfifo buffer */
             mutex_lock(&consumer_lock);
             produce_board();
+            draw_order = 5;
             mutex_unlock(&consumer_lock);
 
             wake_up_interruptible(&rx_wait);
@@ -366,7 +406,11 @@ static void timer_handler(struct timer_list *__timer)
             mod_timer(&timer, jiffies + msecs_to_jiffies(delay));
         }
 
+
         read_unlock(&attr_obj.lock);
+        write_lock(&attr_obj.lock);
+        attr_obj.win = win;
+        write_unlock(&attr_obj.lock);
 
         pr_info("kxo: %c win!!!\n", win);
     }
@@ -518,6 +562,7 @@ static int __init kxo_init(void)
     attr_obj.display = '1';
     attr_obj.resume = '1';
     attr_obj.end = '0';
+    attr_obj.win = ' ';
     rwlock_init(&attr_obj.lock);
     /* Setup the timer */
     timer_setup(&timer, timer_handler, 0);
